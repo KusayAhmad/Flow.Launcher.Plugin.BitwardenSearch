@@ -24,7 +24,7 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
         private readonly string _cacheFilePath;
         private readonly object _cacheLock = new object();
         private Dictionary<string, CachedVaultItem> _cache;
-        private readonly TimeSpan _cacheExpiration = TimeSpan.FromHours(24);
+        private readonly TimeSpan _cacheExpiration = TimeSpan.FromHours(48); // Increased from 24 hours for better performance
 
         public VaultItemCache(string cacheDirectory)
         {
@@ -120,15 +120,65 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
         {
             lock (_cacheLock)
             {
+                Logger.Log($"🔍 Searching vault cache for: '{searchTerm}'", LogLevel.Debug);
                 CleanExpiredEntries();
-                var searchTermLower = searchTerm.ToLower();
                 
-                return _cache
+                if (string.IsNullOrWhiteSpace(searchTerm))
+                {
+                    Logger.Log("❌ Search term is empty", LogLevel.Debug);
+                    return new List<BitwardenItem>();
+                }
+                
+                var searchTermLower = searchTerm.ToLower();
+                var searchWords = searchTermLower.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                
+                Logger.Log($"🔍 Search words: [{string.Join(", ", searchWords)}]", LogLevel.Debug);
+                
+                var matchingItems = _cache
                     .Values
-                    .Where(item => 
-                        item.Name.ToLower().Contains(searchTermLower) ||
-                        (item.Username?.ToLower().Contains(searchTermLower) ?? false) ||
-                        item.Uris.Any(uri => uri.ToLower().Contains(searchTermLower)))
+                    .Where(item =>
+                    {
+                        var itemName = item.Name.ToLower();
+                        var itemUsername = item.Username?.ToLower() ?? "";
+                        var itemUris = item.Uris.Select(uri => uri.ToLower()).ToList();
+                        
+                        // Check if all search words are contained in the item
+                        var matches = searchWords.All(word =>
+                            itemName.Contains(word) ||
+                            itemUsername.Contains(word) ||
+                            itemUris.Any(uri => uri.Contains(word))
+                        );
+                        
+                        if (matches)
+                        {
+                            Logger.Log($"✅ Cache match: '{item.Name}'", LogLevel.Debug);
+                        }
+                        
+                        return matches;
+                    })
+                    .OrderByDescending(item =>
+                    {
+                        // Score based on how well the search term matches
+                        var score = 0;
+                        var itemName = item.Name.ToLower();
+                        var itemUsername = item.Username?.ToLower() ?? "";
+                        
+                        // Exact name match gets highest score
+                        if (itemName.Equals(searchTermLower))
+                            score += 100;
+                        // Name starts with search term
+                        else if (itemName.StartsWith(searchTermLower))
+                            score += 50;
+                        // Name contains search term
+                        else if (itemName.Contains(searchTermLower))
+                            score += 25;
+                        
+                        // Username matches
+                        if (itemUsername.Contains(searchTermLower))
+                            score += 10;
+                        
+                        return score;
+                    })
                     .Select(item =>
                     {
                         Logger.Log($"Returning cached item {item.Name} with reprompt value: {item.Reprompt}", LogLevel.Debug);
@@ -146,6 +196,9 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
                         };
                     })
                     .ToList();
+                
+                Logger.Log($"🎯 Cache search complete: Found {matchingItems.Count} results for '{searchTerm}'", LogLevel.Debug);
+                return matchingItems;
             }
         }
 
@@ -153,11 +206,21 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
         {
             lock (_cacheLock)
             {
-                if (_cache.Count == 0) return false;
+                Logger.Log($"🔍 Checking vault cache validity. Cache count: {_cache.Count}", LogLevel.Debug);
+                
+                if (_cache.Count == 0) 
+                {
+                    Logger.Log("❌ Vault cache is empty", LogLevel.Debug);
+                    return false;
+                }
 
                 // Check if any item is still valid (not expired)
                 var now = DateTime.Now;
-                return _cache.Any(kvp => (now - kvp.Value.CacheTime) <= _cacheExpiration);
+                var validItems = _cache.Count(kvp => (now - kvp.Value.CacheTime) <= _cacheExpiration);
+                var isValid = validItems > 0;
+                
+                Logger.Log($"✅ Vault cache validity: {isValid} (valid items: {validItems}/{_cache.Count})", LogLevel.Debug);
+                return isValid;
             }
         }
 

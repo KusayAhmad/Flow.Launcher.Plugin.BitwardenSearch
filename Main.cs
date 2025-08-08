@@ -27,7 +27,7 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
         private readonly SemaphoreSlim _initializationLock = new SemaphoreSlim(1, 1);
         private string? _faviconCacheDir;
         private Dictionary<string, (Result Result, BitwardenItem Item)> _currentResults = new Dictionary<string, (Result, BitwardenItem)>();
-        private const int DebounceDelay = 300; // milliseconds
+        private const int DebounceDelay = 150; // milliseconds - Reduced from 300 for faster response
         private CancellationTokenSource _debounceTokenSource;
         private PluginInitContext _context = null!;
         private BitwardenFlowSettings _settings = null!;
@@ -44,12 +44,16 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
         private static readonly TimeSpan LockCheckCooldown = TimeSpan.FromSeconds(5);
         private SemaphoreSlim _iconCacheThrottler = new SemaphoreSlim(5);
         private VaultItemCache? _vaultItemCache;
+        
+        // Quick search cache for recent queries
+        private readonly Dictionary<string, (List<BitwardenItem> Results, DateTime CacheTime)> _quickSearchCache = new();
+        private readonly TimeSpan _quickSearchCacheExpiration = TimeSpan.FromMinutes(5);
 
         public Main()
         {
             _httpClient = new HttpClient
             {
-                Timeout = TimeSpan.FromSeconds(10)
+                Timeout = TimeSpan.FromSeconds(5) // Reduced from 10 seconds for faster response
             };
             _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
             _debounceTokenSource = new CancellationTokenSource();
@@ -1573,6 +1577,27 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
         {
             try
             {
+                Logger.Log($"SearchBitwardenAsync called with term: '{searchTerm}'", LogLevel.Debug);
+
+                // Check quick search cache first
+                if (_quickSearchCache.TryGetValue(searchTerm, out var quickCacheEntry))
+                {
+                    if (DateTime.Now - quickCacheEntry.CacheTime <= _quickSearchCacheExpiration)
+                    {
+                        Logger.Log($"✅ QUICK CACHE HIT: Found {quickCacheEntry.Results.Count} results for '{searchTerm}'", LogLevel.Info);
+                        return quickCacheEntry.Results;
+                    }
+                    else
+                    {
+                        Logger.Log($"❌ QUICK CACHE EXPIRED: Removing entry for '{searchTerm}'", LogLevel.Debug);
+                        _quickSearchCache.Remove(searchTerm);
+                    }
+                }
+                else
+                {
+                    Logger.Log($"ℹ️ QUICK CACHE MISS: No entry found for '{searchTerm}'", LogLevel.Debug);
+                }
+
                 if (_serveProcess == null || _serveProcess.HasExited)
                 {
                     Logger.Log("Bitwarden server is not running. Attempting to start...", LogLevel.Warning);
@@ -1580,7 +1605,7 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
                 }
 
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                cts.CancelAfter(TimeSpan.FromSeconds(10));
+                cts.CancelAfter(TimeSpan.FromSeconds(5)); // Reduced from 10 seconds for faster response
 
                 var sessionKey = Environment.GetEnvironmentVariable("BW_SESSION");
                 if (string.IsNullOrEmpty(sessionKey))
@@ -1589,16 +1614,31 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
                     return new List<BitwardenItem>();
                 }
 
-                // First try to search the cache
+                // Try to search the vault cache as backup
+                List<BitwardenItem> cachedResults = new List<BitwardenItem>();
                 if (_vaultItemCache != null && _vaultItemCache.IsCacheValid())
                 {
-                    var cachedResults = _vaultItemCache.SearchCache(searchTerm);
+                    cachedResults = _vaultItemCache.SearchCache(searchTerm);
+                    Logger.Log($"🗂️ VAULT CACHE: Found {cachedResults.Count} results for '{searchTerm}'", LogLevel.Debug);
+                    
+                    // If we have cached results, return them immediately
                     if (cachedResults.Any())
                     {
-                        Logger.Log($"Found {cachedResults.Count} results in cache for search term: {searchTerm}", LogLevel.Debug);
+                        Logger.Log($"✅ VAULT CACHE HIT: Returning {cachedResults.Count} results for '{searchTerm}'", LogLevel.Info);
+                        
+                        // Also save to quick cache for next time
+                        _quickSearchCache[searchTerm] = (cachedResults, DateTime.Now);
+                        Logger.Log($"💾 Saved {cachedResults.Count} results to quick cache for '{searchTerm}'", LogLevel.Debug);
+                        
                         return cachedResults;
                     }
                 }
+                else
+                {
+                    Logger.Log("🗂️ VAULT CACHE: Invalid or empty", LogLevel.Debug);
+                }
+
+                Logger.Log($"🔍 PERFORMING CLI SEARCH for '{searchTerm}'", LogLevel.Info);
 
                 var process = new Process
                 {
@@ -1628,16 +1668,31 @@ namespace Flow.Launcher.Plugin.BitwardenSearch
                 }
 
                 var items = JsonConvert.DeserializeObject<List<BitwardenItem>>(output) ?? new List<BitwardenItem>();
+                Logger.Log($"🎯 CLI SEARCH COMPLETE: Found {items.Count} items for '{searchTerm}'", LogLevel.Info);
+                
                 foreach (var item in items)
                 {
                     Logger.Log($"Deserialized item {item.name} - TOTP status: hasTotp={item.hasTotp}, " +
                             $"login null={item.login == null}", LogLevel.Debug);
                 }
 
-                // Update cache with new results
+                // Update vault cache with new results
                 if (_vaultItemCache != null && items.Any())
                 {
                     _vaultItemCache.UpdateCache(items);
+                    Logger.Log($"💾 Updated vault cache with {items.Count} items", LogLevel.Debug);
+                }
+
+                // Update quick search cache
+                _quickSearchCache[searchTerm] = (items, DateTime.Now);
+                Logger.Log($"💾 Saved {items.Count} results to quick cache for '{searchTerm}' (expires in {_quickSearchCacheExpiration.TotalMinutes} minutes)", LogLevel.Debug);
+                
+                // Clean old entries from quick cache (keep only last 10 searches)
+                if (_quickSearchCache.Count > 10)
+                {
+                    var oldestEntry = _quickSearchCache.OrderBy(kvp => kvp.Value.CacheTime).First();
+                    _quickSearchCache.Remove(oldestEntry.Key);
+                    Logger.Log($"🧹 Cleaned old quick cache entry: '{oldestEntry.Key}'", LogLevel.Debug);
                 }
 
                 return items;
